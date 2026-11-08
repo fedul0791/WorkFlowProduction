@@ -5,7 +5,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy import select, func
 from sqlalchemy.orm import Session
 from app.db.session import get_db
-from app.models import Company, Site, Department, Area, Workstation, Equipment, EquipmentAssignment, Employee, EmployeeWorkAssignment, AuditEvent
+from app.models import Company, Site, Department, Area, Workstation, Equipment, EquipmentAssignment, Employee, EmployeeWorkAssignment, AuditEvent, CanvasObject
 from app.core.security import csrf_protect, require_permission, audit as audit_change
 
 router = APIRouter(prefix="/api/v1", tags=["enterprise"], dependencies=[Depends(csrf_protect)])
@@ -34,6 +34,23 @@ class AssignmentInput(BaseModel):
     area_id: UUID | None = None
     workstation_id: UUID | None = None
     valid_from: datetime | None = None
+class CanvasObjectInput(BaseModel):
+    name: str = Field(min_length=1, max_length=180)
+    description: str | None = None
+    object_type: str = Field(default="custom", min_length=1, max_length=80)
+    parent_id: UUID | None
+class CanvasObjectPatch(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=180)
+    description: str | None = None
+    object_type: str | None = Field(default=None, min_length=1, max_length=80)
+    parent_id: UUID | None = None
+    x: float | None = Field(default=None, ge=-100000, le=100000)
+    y: float | None = Field(default=None, ge=-100000, le=100000)
+    width: float | None = Field(default=None, ge=40, le=10000)
+    height: float | None = Field(default=None, ge=40, le=10000)
+    rotation: float | None = Field(default=None, ge=-36000, le=36000)
+    placed: bool | None = None
+    locked: bool | None = None
 
 
 def audit(db: Session, tenant_id: UUID, kind: str, entity_id: UUID, action: str, before=None, after=None):
@@ -47,6 +64,242 @@ def company_or_404(db, cid):
     row=db.scalar(select(Company).where(Company.id==cid,Company.tenant_id==db.info.get("tenant_id")))
     if not row: raise HTTPException(404,"Company not found")
     return row
+
+def canvas_object_data(row: CanvasObject):
+    return {
+        "id": str(row.id),
+        "name": row.name,
+        "description": row.description,
+        "object_type": row.object_type,
+        "parent_id": str(row.parent_id) if row.parent_id else None,
+        "x": row.x,
+        "y": row.y,
+        "width": row.width,
+        "height": row.height,
+        "rotation": row.rotation,
+        "placed": row.placed,
+        "locked": row.locked,
+        "archived_at": row.archived_at.isoformat() if row.archived_at else None,
+        "created_at": row.created_at.isoformat() if row.created_at else None,
+        "updated_at": row.updated_at.isoformat() if row.updated_at else None,
+    }
+
+
+CANVAS_ALLOWED_CHILDREN = {
+    "enterprise": {"shop", "plot", "box", "warehouse", "building", "room", "work_area", "workstation", "person"},
+    "building": {"shop", "plot", "box", "warehouse", "room", "work_area", "office", "workstation", "person"},
+    "shop": {"plot", "box", "work_area", "room", "workstation", "warehouse", "person"},
+    "plot": {"box", "work_area", "room", "workstation", "warehouse", "person"},
+    "box": {"work_area", "room", "workstation", "warehouse_area", "person"},
+    "warehouse": {"warehouse_area", "work_area", "workstation", "room", "person"},
+    "work_area": {"workstation", "post", "station", "person"},
+    "room": {"building", "work_area", "workstation", "person"},
+    "office": set(),
+    "warehouse_area": set(),
+    "workstation": {"person"},
+    "post": {"person"},
+    "station": {"person"},
+    "person": set(),
+}
+CANVAS_ROLE_ALIASES = {
+    "company": "enterprise", "firma": "enterprise", "site": "enterprise", "factory": "enterprise",
+    "plant": "enterprise", "werk": "enterprise", "unternehmen": "enterprise", "предприятие": "enterprise",
+    "завод": "enterprise", "площадка": "enterprise", "house": "building", "gebäude": "building",
+    "здание": "building", "дом": "building", "apartment": "room", "квартира": "room", "raum": "room",
+    "комната": "room", "büro": "office", "офис": "office", "workshop": "shop", "werkhalle": "shop",
+    "цех": "shop", "area": "plot", "bereich": "plot", "участок": "plot", "bay": "box", "бокс": "box",
+    "lager": "warehouse", "склад": "warehouse", "work area": "work_area", "arbeitsbereich": "work_area",
+    "рабочая зона": "work_area", "arbeitsplatz": "workstation", "рабочее место": "workstation",
+    "warehouse area": "warehouse_area", "lagerbereich": "warehouse_area", "складская зона": "warehouse_area",
+    "пост": "post", "stationen": "station", "станция": "station", "employee": "person",
+    "mitarbeiter": "person", "персона": "person", "сотрудник": "person",
+}
+
+
+def canvas_role(object_type: str) -> str | None:
+    normalized = object_type.strip().lower()
+    return normalized if normalized in CANVAS_ALLOWED_CHILDREN else CANVAS_ROLE_ALIASES.get(normalized)
+
+
+def validate_canvas_parent(db: Session, tenant_id: UUID, child_type: str, parent_id: UUID | None, child_id: UUID | None = None):
+    child_role = canvas_role(child_type)
+    if child_role is None:
+        raise HTTPException(422, "Unknown canvas object type")
+    if child_role == "enterprise":
+        if parent_id is not None:
+            raise HTTPException(422, "Enterprise / plant must be a root object")
+        duplicate_query = select(CanvasObject).where(
+            CanvasObject.tenant_id == tenant_id,
+            CanvasObject.archived_at.is_(None),
+        )
+        if child_id is not None:
+            duplicate_query = duplicate_query.where(CanvasObject.id != child_id)
+        if any(canvas_role(item.object_type) == "enterprise" for item in db.scalars(duplicate_query).all()):
+            raise HTTPException(409, "Only one active enterprise / plant root is allowed")
+        return
+    if parent_id is None:
+        raise HTTPException(422, "Choose the object that will contain this object")
+    parent = db.scalar(select(CanvasObject).where(CanvasObject.id == parent_id, CanvasObject.tenant_id == tenant_id))
+    if parent is None:
+        raise HTTPException(404, "Canvas parent object not found")
+    if parent.archived_at:
+        raise HTTPException(409, "Cannot place an object inside an archived parent")
+    parent_role = canvas_role(parent.object_type)
+    if parent_role is None or child_role not in CANVAS_ALLOWED_CHILDREN[parent_role]:
+        raise HTTPException(422, "This object type is not allowed inside the selected parent")
+    current = parent
+    visited = set()
+    while current is not None:
+        if current.id == child_id:
+            raise HTTPException(422, "Canvas object hierarchy cannot contain a cycle")
+        if current.id in visited:
+            raise HTTPException(409, "Existing canvas object hierarchy contains a cycle")
+        visited.add(current.id)
+        current = db.scalar(select(CanvasObject).where(
+            CanvasObject.id == current.parent_id,
+            CanvasObject.tenant_id == tenant_id,
+        )) if current.parent_id else None
+
+def canvas_object_or_404(db: Session, tenant_id: UUID, object_id: UUID):
+    row = db.scalar(select(CanvasObject).where(CanvasObject.id == object_id, CanvasObject.tenant_id == tenant_id))
+    if not row:
+        raise HTTPException(404, "Canvas object not found")
+    return row
+
+@router.get("/companies/{company_id}/canvas-objects", dependencies=[Depends(require_permission("structure:read"))])
+def list_canvas_objects(company_id: UUID, db: Session = Depends(get_db)):
+    company = company_or_404(db, company_id)
+    rows = db.scalars(
+        select(CanvasObject)
+        .where(CanvasObject.tenant_id == company.tenant_id, CanvasObject.archived_at.is_(None))
+        .order_by(CanvasObject.created_at, CanvasObject.id)
+    ).all()
+    return [canvas_object_data(row) for row in rows]
+
+@router.post("/companies/{company_id}/canvas-objects", status_code=201, dependencies=[Depends(require_permission("structure:write"))])
+def create_canvas_object(company_id: UUID, payload: CanvasObjectInput, db: Session = Depends(get_db)):
+    company = company_or_404(db, company_id)
+    name = payload.name.strip()
+    if not name:
+        raise HTTPException(422, "Name must not be empty")
+    object_type = payload.object_type.strip()
+    if not object_type:
+        raise HTTPException(422, "Object type must not be empty")
+    validate_canvas_parent(db, company.tenant_id, object_type, payload.parent_id)
+    row = CanvasObject(tenant_id=company.tenant_id, name=name, description=payload.description, object_type=object_type, parent_id=payload.parent_id)
+    db.add(row)
+    db.flush()
+    audit(db, company.tenant_id, "canvas_object", row.id, "create", after=canvas_object_data(row))
+    db.commit()
+    db.refresh(row)
+    return canvas_object_data(row)
+
+@router.patch("/companies/{company_id}/canvas-objects/{object_id}", dependencies=[Depends(require_permission("structure:write"))])
+def patch_canvas_object(company_id: UUID, object_id: UUID, payload: CanvasObjectPatch, db: Session = Depends(get_db)):
+    company = company_or_404(db, company_id)
+    row = canvas_object_or_404(db, company.tenant_id, object_id)
+    if row.archived_at:
+        raise HTTPException(409, "Archived canvas objects cannot be edited")
+    before = canvas_object_data(row)
+    changes = payload.model_dump(exclude_unset=True)
+    if "name" in changes:
+        if changes["name"] is None:
+            raise HTTPException(422, "Name must not be empty")
+        changes["name"] = changes["name"].strip()
+        if not changes["name"]:
+            raise HTTPException(422, "Name must not be empty")
+    if "object_type" in changes:
+        if changes["object_type"] is None or not changes["object_type"].strip():
+            raise HTTPException(422, "Object type must not be empty")
+        changes["object_type"] = changes["object_type"].strip()
+    relationship_changed = (
+        ("parent_id" in changes and changes["parent_id"] != row.parent_id)
+        or ("object_type" in changes and changes["object_type"] != row.object_type)
+    )
+    if relationship_changed:
+        validate_canvas_parent(
+            db,
+            company.tenant_id,
+            changes.get("object_type", row.object_type),
+            changes.get("parent_id", row.parent_id),
+            row.id,
+        )
+    for key, value in changes.items():
+        if value is not None or key == "description":
+            setattr(row, key, value)
+    audit(db, company.tenant_id, "canvas_object", row.id, "update", before=before, after=canvas_object_data(row))
+    db.commit()
+    db.refresh(row)
+    return canvas_object_data(row)
+
+@router.get("/companies/{company_id}/canvas-objects/trash", dependencies=[Depends(require_permission("structure:read"))])
+def list_canvas_object_trash(company_id: UUID, db: Session = Depends(get_db)):
+    company = company_or_404(db, company_id)
+    rows = db.scalars(
+        select(CanvasObject)
+        .where(CanvasObject.tenant_id == company.tenant_id, CanvasObject.archived_at.is_not(None))
+        .order_by(CanvasObject.archived_at.desc(), CanvasObject.name)
+    ).all()
+    return [canvas_object_data(row) for row in rows]
+
+@router.post("/companies/{company_id}/canvas-objects/{object_id}/archive", dependencies=[Depends(require_permission("structure:write"))])
+def archive_canvas_object(company_id: UUID, object_id: UUID, db: Session = Depends(get_db)):
+    company = company_or_404(db, company_id)
+    row = canvas_object_or_404(db, company.tenant_id, object_id)
+    if row.archived_at:
+        return canvas_object_data(row)
+    active_child = db.scalar(select(CanvasObject.id).where(
+        CanvasObject.tenant_id == company.tenant_id,
+        CanvasObject.parent_id == row.id,
+        CanvasObject.archived_at.is_(None),
+    ).limit(1))
+    if active_child:
+        raise HTTPException(409, "Move or archive child objects before archiving this object")
+    before = canvas_object_data(row)
+    row.archived_at = datetime.now(timezone.utc)
+    audit(db, company.tenant_id, "canvas_object", row.id, "archive", before=before, after=canvas_object_data(row))
+    db.commit()
+    db.refresh(row)
+    return canvas_object_data(row)
+
+@router.post("/companies/{company_id}/canvas-objects/{object_id}/restore", dependencies=[Depends(require_permission("structure:write"))])
+def restore_canvas_object(company_id: UUID, object_id: UUID, db: Session = Depends(get_db)):
+    company = company_or_404(db, company_id)
+    row = canvas_object_or_404(db, company.tenant_id, object_id)
+    if row.archived_at is None:
+        raise HTTPException(409, "Canvas object is already active")
+    if row.parent_id:
+        parent = db.scalar(select(CanvasObject).where(
+            CanvasObject.id == row.parent_id,
+            CanvasObject.tenant_id == company.tenant_id,
+        ))
+        if parent is None or parent.archived_at:
+            raise HTTPException(409, "Restore the parent object before restoring this object")
+    validate_canvas_parent(db, company.tenant_id, row.object_type, row.parent_id, row.id)
+    before = canvas_object_data(row)
+    row.archived_at = None
+    audit(db, company.tenant_id, "canvas_object", row.id, "restore", before=before, after=canvas_object_data(row))
+    db.commit()
+    db.refresh(row)
+    return canvas_object_data(row)
+
+@router.post("/companies/{company_id}/canvas-objects/{object_id}/purge", status_code=204, dependencies=[Depends(require_permission("structure:write"))])
+def purge_canvas_object(company_id: UUID, object_id: UUID, db: Session = Depends(get_db)):
+    company = company_or_404(db, company_id)
+    row = canvas_object_or_404(db, company.tenant_id, object_id)
+    if row.archived_at is None:
+        raise HTTPException(409, "Archive the canvas object before permanently deleting it")
+    child = db.scalar(select(CanvasObject.id).where(
+        CanvasObject.tenant_id == company.tenant_id,
+        CanvasObject.parent_id == row.id,
+    ).limit(1))
+    if child:
+        raise HTTPException(409, "Move or permanently delete child objects before deleting this object")
+    before = canvas_object_data(row)
+    audit(db, company.tenant_id, "canvas_object", row.id, "purge", before=before)
+    db.delete(row)
+    db.commit()
+    return None
 
 def get_node(db, tenant_id, kind, node_id):
     model=KINDS[kind]
